@@ -299,8 +299,8 @@ object SettingsDomains {
                       set = ScreensaverConfig::setBlurBackground,
                       help = "Fills letterbox sidebars in fit mode with a blurred copy of the photo instead of solid black."),
                   // On-device cache: only meaningful for a network source that re-fetches the same
-                  // assets every loop (Immich / WebDAV). Hidden for a local folder or the built-in
-                  // feed, where there's nothing to save a round-trip on.
+                  // assets every loop (Immich / WebDAV / network share). Hidden for a local folder
+                  // or the built-in feed, where there's nothing to save a round-trip on.
                   BoolSpec(
                       "cacheEnabled",
                       "Store media on this device",
@@ -312,7 +312,7 @@ object SettingsDomains {
                               "small share is swapped for new picks from your server on a slow " +
                               "schedule. Videos are shrunk to fit the screen. The frame keeps playing " +
                               "if the server is down.",
-                      visible = { _, s -> s.usesImmich || s.usesDav }),
+                      visible = { _, s -> s.usesImmich || s.usesDav || s.usesSmb }),
                   IntSpec(
                       "cacheBudgetGb",
                       "Storage limit",
@@ -326,7 +326,7 @@ object SettingsDomains {
                           "The most storage the saved copies may use. If your album is bigger than " +
                               "this, a random part of it is kept and slowly rotated. Also limited by " +
                               "free space.",
-                      visible = { _, s -> (s.usesImmich || s.usesDav) && s.cacheEnabled }),
+                      visible = { _, s -> (s.usesImmich || s.usesDav || s.usesSmb) && s.cacheEnabled }),
                   IntSpec(
                       "cacheRotatePercent",
                       "Swap per refresh",
@@ -340,7 +340,7 @@ object SettingsDomains {
                           "When storage is full, this share of the saved photos and videos is " +
                               "replaced with new random picks from your server at each refresh. " +
                               "Only the new items are downloaded. Off keeps the same selection.",
-                      visible = { _, s -> (s.usesImmich || s.usesDav) && s.cacheEnabled }),
+                      visible = { _, s -> (s.usesImmich || s.usesDav || s.usesSmb) && s.cacheEnabled }),
                   IntSpec(
                       "cacheRefreshHours",
                       "Refresh from server every",
@@ -354,7 +354,7 @@ object SettingsDomains {
                           "How often this device checks your server: it picks up new and removed " +
                               "items and swaps part of the selection. Between refreshes the server " +
                               "isn't contacted at all.",
-                      visible = { _, s -> (s.usesImmich || s.usesDav) && s.cacheEnabled }),
+                      visible = { _, s -> (s.usesImmich || s.usesDav || s.usesSmb) && s.cacheEnabled }),
                   BoolSpec(
                       "batterySaver",
                       "Sleep on battery when nobody's around",

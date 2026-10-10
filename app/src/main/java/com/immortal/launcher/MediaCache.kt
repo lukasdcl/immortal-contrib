@@ -12,7 +12,10 @@ import java.io.File
 import java.security.MessageDigest
 
 /**
- * On-device cache of screensaver media, shared by every HTTP remote source (Immich, WebDAV).
+ * On-device cache of screensaver media, shared by the remote sources whose items live at stable
+ * addresses: Immich, WebDAV, and SMB network shares. (Public shared albums are deliberately NOT
+ * cached — iCloud/Google hand out short-lived signed URLs, so their keys would churn every time
+ * the links are re-minted; see PhotoFrameController.reresolveOrFallback.)
  * Images are stored as fetched; videos are stored as screen-sized (1200x800) H.264 derivatives
  * produced by [VideoTranscoder]. Which assets are resident is decided by the [CachePool] stored
  * beside the media ([poolFile]): a random selection of the source filled up to the budget, then
@@ -20,9 +23,10 @@ import java.security.MessageDigest
  * local storage on every loop.
  *
  * Keyed by a stable hash of the item's URL, so the same asset maps to the same file across runs
- * and app restarts. The budget is still enforced as a size-capped LRU ([enforceBudget]) as a
- * backstop for a lowered storage limit; in normal operation the pool stops filling at [hasRoom]
- * and nothing is evicted.
+ * and app restarts. Callers whose identifiers are not globally unique qualify them first — an SMB
+ * playlist entry is only share-relative, so PhotoFrameController prefixes "smb://host/share/".
+ * The budget is still enforced as a size-capped LRU ([enforceBudget]) as a backstop for a lowered
+ * storage limit; in normal operation the pool stops filling at [hasRoom] and nothing is evicted.
  *
  * All operations are best-effort: a failure returns null/false and the caller falls back to a
  * direct fetch, so the frame is never blank because of a cache problem.

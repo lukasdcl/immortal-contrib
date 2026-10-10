@@ -38,10 +38,16 @@ class SmbSource(
     private val password: String,
     private val domain: String? = null,
 ) {
-  private var client: SMBClient? = null
-  private var connection: Connection? = null
-  private var session: Session? = null
-  private var share: DiskShare? = null
+  @Volatile private var client: SMBClient? = null
+  @Volatile private var connection: Connection? = null
+  @Volatile private var session: Session? = null
+  @Volatile private var share: DiskShare? = null
+  // Set by [close]; a closed source never reconnects (a late cache fill or caption read on another
+  // thread must not quietly reopen a connection nobody will close).
+  @Volatile private var closed = false
+  // When the last [ensureConnected] attempt failed, so a NAS that's asleep isn't re-dialled (and
+  // its timeouts re-paid) for every photo in a row. See [RECONNECT_BACKOFF_MS].
+  @Volatile private var lastFailMs = 0L
 
   /** Open the share. Returns true on success. */
   fun connect(): Boolean =
@@ -57,6 +63,24 @@ class SmbSource(
             true
           }
           .getOrDefault(false)
+
+  /**
+   * Connect if not already connected. Safe to call from any thread and as often as needed: the
+   * screensaver uses this so it can start painting cached photos before the share is reached, and
+   * only dials the NAS when something actually needs it (a cache miss, a caption, a listing).
+   * After a failure, further attempts within [RECONNECT_BACKOFF_MS] return false immediately.
+   */
+  @Synchronized
+  fun ensureConnected(): Boolean {
+    if (closed) return false
+    if (share != null) return true
+    val now = System.currentTimeMillis()
+    if (lastFailMs != 0L && now - lastFailMs < RECONNECT_BACKOFF_MS) return false
+    val ok = connect()
+    lastFailMs = if (ok) 0L else now
+    if (ok && closed) close() // closed while we were dialling
+    return ok && !closed
+  }
 
   /** Recursively list image file paths (share-relative, backslash-separated), capped at [cap]. */
   fun listImages(cap: Int = 1000): List<String> {
@@ -101,6 +125,7 @@ class SmbSource(
           .getOrNull()
 
   fun close() {
+    closed = true
     runCatching { share?.close() }
     runCatching { session?.close() }
     runCatching { connection?.close() }
@@ -114,4 +139,8 @@ class SmbSource(
   /** Strip leading/trailing slashes and convert to SMB backslash separators. */
   private fun normalize(p: String): String =
       p.trim().trim('/', '\\').replace('/', '\\')
+
+  private companion object {
+    const val RECONNECT_BACKOFF_MS = 30_000L
+  }
 }

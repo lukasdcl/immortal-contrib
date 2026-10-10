@@ -199,10 +199,16 @@ class PhotoFrameController(
   private var remoteVideos: Set<String> = emptySet()
   // Optional custom fetcher for the remote path: when set (SMB), each "url" is fetched through
   // this instead of an HTTP download, so SMB reuses all the remote advance/tick/fallback logic.
-  private var remoteFetch: ((String) -> Bitmap?)? = null
+  // It returns raw bytes rather than a decoded Bitmap so the media cache can store what it
+  // fetched — a Bitmap-returning fetcher could never feed [MediaCache.putImage], which is why
+  // the cache used to be HTTP-only.
+  private var remoteFetch: ((String) -> ByteArray?)? = null
   private var smbSource: SmbSource? = null
-  // On-device media cache for stable-URL HTTP sources (Immich, WebDAV): images are stored as
-  // fetched, videos as 1200x800 derivatives. Null unless such a source is active and the user
+  // [smbPrefix] of the active share ("" otherwise): stripped from a playlist entry to get the
+  // path [SmbSource] reads. See [smbPrefix] for why entries carry it.
+  private var smbEntryPrefix: String = ""
+  // On-device media cache for stable-address remote sources (Immich, WebDAV, network share): images
+  // are stored as fetched, videos as 1200x800 derivatives. Null unless such a source is active and the user
   // turned caching on. Which assets are resident is the [pool]: a random selection of the source
   // filled to the budget, then rotated once a day by a sync worker on [transcodeIo], and the
   // slideshow plays only the pool. See [startPooled]/[runPoolSync]/[fetchRemoteImage].
@@ -460,20 +466,39 @@ class PhotoFrameController(
                 user = source.user,
                 password = source.pass,
             )
+        // Nothing here touches the network, so a pool that already holds photos paints from local
+        // disk before there is so much as a TCP connection to the NAS. The share is connected on
+        // first need instead — a cache miss, or the pool's listing — by [SmbSource.ensureConnected].
+        val prefix = smbPrefix(source.host, source.share)
+        smbSource = src
+        smbEntryPrefix = prefix
+        remoteFetch = { entry ->
+          if (src.ensureConnected()) src.openStream(smbRelativePath(entry, prefix))?.use { it.readBytes() }
+          else null
+        }
+        // The folder is part of the key, so re-pointing the frame at another folder on the same
+        // share starts a fresh pool rather than replaying the old folder's photos.
+        val poolKey = "smb|$prefix${source.path.trim()}"
+        val pooled =
+            startPooled(poolKey, emptyMap(), source.shuffle) {
+              if (!src.ensureConnected()) null
+              else src.listImages(cap = POOL_LIST_CAP).map { CachePool.Entry(prefix + it, isVideo = false) }
+            }
+        if (pooled) return
         io.execute {
-          val paths = if (src.connect()) src.listImages() else emptyList()
+          val paths = if (src.ensureConnected()) src.listImages() else emptyList()
           ui.post {
+            if (smbSource !== src) return@post // source changed / stopped while connecting
             if (paths.isNotEmpty()) {
-              smbSource = src
-              remoteUrls = if (source.shuffle) paths.shuffled() else paths
-              remoteFetch = { p -> src.openStream(p)?.use { decodeBoundedStream(it) } }
+              val entries = paths.map { prefix + it }
+              remoteUrls = if (source.shuffle) entries.shuffled() else entries
               remoteMode = true
               remoteIndex = -1
               remoteFailStreak = 0
               advanceRemote(+1)
             } else {
               // Share unreachable / no images → never leave the frame blank.
-              src.close()
+              Log.w(TAG, "SMB share gave no photos ($prefix${source.path}); falling back to built-in feed")
               startWeb()
             }
           }
@@ -612,12 +637,28 @@ class PhotoFrameController(
     }
   }
 
-  /** Same as [loadCaptionForLocal] but for an SMB file: a fresh read stream feeds EXIF. */
-  private fun loadCaptionForSmb(path: String, g: Int) {
+  /**
+   * Same as [loadCaptionForLocal] but for a network-share photo. [entry] is the playlist entry
+   * (see [smbPrefix]). Prefers the cached copy when there is one: the caption is a second read of
+   * a file the frame has *just* fetched, so without this a cached photo would still cost one full
+   * pull off the share every time it came round — halving the traffic instead of removing it.
+   * Falls back to a fresh stream from the share when the file isn't cached.
+   *
+   * [mediaCache] and the prefix are captured on the UI thread (both are mutated there); the
+   * lookup itself, which touches the disk, happens on [metaIo] with the rest of the work.
+   */
+  private fun loadCaptionForSmb(entry: String, g: Int) {
     val src = smbSource ?: return
+    val cache = mediaCache
+    val path = smbRelativePath(entry, smbEntryPrefix)
     metaIo.execute {
+      val cached = cache?.getIfPresent(entry, isVideo = false)
       val meta =
-          runCatching { src.openStream(path)?.use { PhotoCaption.read(ExifInterface(it)) } }
+          runCatching {
+                if (cached != null) PhotoCaption.read(ExifInterface(cached.path))
+                else if (src.ensureConnected()) src.openStream(path)?.use { PhotoCaption.read(ExifInterface(it)) }
+                else null
+              }
               .getOrNull()
       publishCaption(meta, g)
     }
@@ -1518,6 +1559,7 @@ class PhotoFrameController(
     poolLive = false
     smbSource?.let { s -> io.execute { runCatching { s.close() } } }
     smbSource = null
+    smbEntryPrefix = ""
     ui.removeCallbacks(remoteTick)
     ui.removeCallbacks(remoteRefresh)
     ui.removeCallbacks(poolSyncTick)
@@ -2116,20 +2158,36 @@ class PhotoFrameController(
   }
 
   /**
-   * Fetch a remote image, going through [mediaCache] when one is active (Immich/WebDAV): a hit
-   * decodes straight from disk with no network. A miss downloads the bytes and decodes; the bytes
-   * are kept only for a pool member whose file went missing, or, during the first fill
+   * Raw bytes for one playlist entry: the source's own fetcher when it has one (SMB reads the
+   * file off the share), otherwise a plain authed HTTP GET. Bytes rather than a Bitmap so the
+   * caller can hand exactly what it fetched to the cache before decoding.
+   *
+   * Deliberately not an elvis over [fetch]'s result: a custom fetcher returning null means *that
+   * read failed*, not "fall back to HTTP" — an SMB entry is not a URL. Callers pass the fetcher and
+   * headers they snapshotted on the UI thread, since both change when the source does.
+   */
+  private fun remoteBytes(
+      url: String,
+      fetch: ((String) -> ByteArray?)?,
+      headers: Map<String, String>,
+  ): ByteArray? = if (fetch != null) fetch(url) else downloadBytes(url, headers)
+
+  /**
+   * Fetch a remote image, going through [mediaCache] when one is active (Immich / WebDAV / network
+   * share): a hit decodes straight from disk with no network. A miss fetches the bytes and decodes;
+   * the bytes are kept only for a pool member whose file went missing, or, during the first fill
    * ([poolLive]), as a new pool member while there is room (saving the sync worker a second
-   * download of the same asset). SMB (a custom [remoteFetch]) and the uncached sources fall back
-   * to the direct path.
+   * download of the same asset). Uncached sources take the direct path. Either way the decode is
+   * the same [MAX_EDGE]-bounded one, so a huge original can't blow the bitmap limit.
    */
   private fun fetchRemoteImage(url: String): Bitmap? {
     val cache = mediaCache
-    if (cache != null && remoteFetch == null) {
+    val fetch = remoteFetch
+    if (cache != null) {
       cache.getIfPresent(url, isVideo = false)?.let { f ->
         runCatching { decodeBoundedFile(f.path) }.getOrNull()?.let { return it }
       }
-      val bytes = runCatching { downloadBytes(url, remoteHeaders) }.getOrNull() ?: return null
+      val bytes = runCatching { remoteBytes(url, fetch, remoteHeaders) }.getOrNull() ?: return null
       val p = pool
       if (p != null) {
         if (p.contains(url)) {
@@ -2140,7 +2198,8 @@ class PhotoFrameController(
       }
       return decodeBoundedBytes(bytes)
     }
-    return remoteFetch?.invoke(url) ?: downloadBitmap(url, remoteHeaders)
+    if (fetch != null) return runCatching { fetch(url) }.getOrNull()?.let { decodeBoundedBytes(it) }
+    return downloadBitmap(url, remoteHeaders)
   }
 
   /** Raw bytes of an authed HTTP GET (for caching before decode). Null on failure. */
@@ -2265,6 +2324,7 @@ class PhotoFrameController(
     }
     val lister = poolLister ?: return
     val headers = remoteHeaders
+    val fetch = remoteFetch
     val tc = transcoder
     poolSyncRunning = true
     // execute can only reject after stop() shut the executor down; reset the guard and move on.
@@ -2306,7 +2366,7 @@ class PhotoFrameController(
                 }
                 if (!cache.hasRoom()) break
                 if (p.contains(e.url)) continue // the live image path got there first
-                if (fetchIntoCache(cache, tc, e, headers)) {
+                if (fetchIntoCache(cache, tc, e, headers, fetch)) {
                   p.add(e)
                   added++
                   streak = 0
@@ -2366,9 +2426,10 @@ class PhotoFrameController(
       tc: VideoTranscoder?,
       e: CachePool.Entry,
       headers: Map<String, String>,
+      fetch: ((String) -> ByteArray?)?,
   ): Boolean {
     if (!e.isVideo) {
-      val bytes = runCatching { downloadBytes(e.url, headers) }.getOrNull() ?: return false
+      val bytes = runCatching { remoteBytes(e.url, fetch, headers) }.getOrNull() ?: return false
       return cache.putImage(e.url, bytes) != null
     }
     tc ?: return false
@@ -2461,6 +2522,17 @@ class PhotoFrameController(
      */
     internal fun singleThread(): ExecutorService =
         ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue(), ThreadPoolExecutor.DiscardPolicy())
+
+    /**
+     * Playlist entries for a network share are "smb://host/share/" + the share-relative path.
+     * The bare relative path ("Photos\2024\img.jpg") is what [SmbSource] reads, but it is not
+     * unique across NASes or shares, and the playlist entry doubles as the [MediaCache] key and
+     * the [CachePool] identity — so the prefix keeps two shares from serving each other's bytes.
+     */
+    internal fun smbPrefix(host: String, share: String): String = "smb://$host/$share/"
+
+    /** The share-relative path inside an [smbPrefix]-qualified entry (unchanged if it has none). */
+    internal fun smbRelativePath(entry: String, prefix: String): String = entry.removePrefix(prefix)
 
     const val TAG = "ImmortalPhotoFrame"
     const val MB = 1024L * 1024L

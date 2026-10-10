@@ -4,11 +4,12 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Pure geometry behind the screensaver's video fill mode (no Context). */
+/** Pure helpers behind the screensaver controller (no Context). */
 class PhotoFrameControllerTest {
 
   @Test
@@ -41,6 +42,34 @@ class PhotoFrameControllerTest {
     assertNull(PhotoFrameController.videoCoverSize(0, 0, 1920, 1080))
     assertNull(PhotoFrameController.videoCoverSize(1920, 1080, 0, 0))
     assertNull(PhotoFrameController.videoCoverSize(-1, 1080, 1920, 1080))
+  }
+
+  // --- network-share playlist entries ---
+
+  @Test
+  fun smbEntries_areQualifiedWithHostAndShare() {
+    // The entry is the MediaCache key and the CachePool identity, so its format must stay stable
+    // across releases or every cached photo on a device would be re-downloaded.
+    val prefix = PhotoFrameController.smbPrefix("nas.local", "Photos")
+    assertEquals("smb://nas.local/Photos/", prefix)
+    assertEquals("smb://nas.local/Photos/2024\\img.jpg", prefix + "2024\\img.jpg")
+  }
+
+  @Test
+  fun smbEntries_roundTripToTheSharePath() {
+    val prefix = PhotoFrameController.smbPrefix("nas.local", "Photos")
+    assertEquals("2024\\img.jpg", PhotoFrameController.smbRelativePath(prefix + "2024\\img.jpg", prefix))
+    // An entry without the prefix is passed through untouched rather than mangled.
+    assertEquals("loose.jpg", PhotoFrameController.smbRelativePath("loose.jpg", prefix))
+  }
+
+  @Test
+  fun smbEntries_sameFileOnTwoSharesNeverShareACacheKey() {
+    val a = PhotoFrameController.smbPrefix("nas-a", "Photos") + "Holidays\\01.jpg"
+    val b = PhotoFrameController.smbPrefix("nas-b", "Photos") + "Holidays\\01.jpg"
+    val c = PhotoFrameController.smbPrefix("nas-a", "Family") + "Holidays\\01.jpg"
+    assertNotEquals(a, b)
+    assertNotEquals(a, c)
   }
 
   // Work queued after stop() must be dropped, not thrown on the main thread.

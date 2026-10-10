@@ -139,7 +139,7 @@ object ScreensaverConfig {
       val albumRefreshMin: Int = DEFAULT_ALBUM_REFRESH_MIN,
       val shuffle: Boolean = false,
       val includeVideo: Boolean = true,
-      // On-device media cache (Immich / WebDAV sources only): download each asset once and replay
+      // On-device media cache (Immich / WebDAV / network-share sources): download each asset once and replay
       // it from local storage on every loop — transcoding videos to a screen-sized copy — instead
       // of re-fetching from the server. Off by default. [cacheBudgetGb] caps the disk it may use
       // (also bounded at runtime by free space). See MediaCache / VideoTranscoder. An album bigger
